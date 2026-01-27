@@ -1,0 +1,146 @@
+name: Deploy S3 Bucket with Vault OIDC
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  id-token: write  # Required for OIDC token generation
+  contents: read
+
+env:
+  VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+  VAULT_NAMESPACE: ${{ secrets.VAULT_NAMESPACE }}  # Optional: for HCP Vault or Enterprise
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_bucket_name: ${{ vars.S3_BUCKET_NAME || 'devsecops-demo-bucket' }}
+  TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}
+
+jobs:
+  terraform-deploy:
+    name: Deploy S3 with Vault Credentials
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      # Step 1: Get GitHub OIDC Token
+      - name: Get GitHub OIDC Token
+        id: github-oidc
+        run: |
+          OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=vault" | jq -r '.value')
+          echo "::add-mask::$OIDC_TOKEN"
+          echo "token=$OIDC_TOKEN" >> $GITHUB_OUTPUT
+
+      # Step 2: Authenticate to Vault using OIDC JWT
+      - name: Authenticate to Vault
+        id: vault-auth
+        run: |
+          # Exchange GitHub OIDC token for Vault token
+          VAULT_RESPONSE=$(curl -s --request POST \
+            --data "{\"role\": \"github-actions\", \"jwt\": \"${{ steps.github-oidc.outputs.token }}\"}" \
+            "$VAULT_ADDR/v1/auth/jwt/login")
+          
+          VAULT_TOKEN=$(echo $VAULT_RESPONSE | jq -r '.auth.client_token')
+          
+          if [ "$VAULT_TOKEN" == "null" ] || [ -z "$VAULT_TOKEN" ]; then
+            echo "Failed to authenticate to Vault"
+            echo $VAULT_RESPONSE | jq .
+            exit 1
+          fi
+          
+          echo "::add-mask::$VAULT_TOKEN"
+          echo "token=$VAULT_TOKEN" >> $GITHUB_OUTPUT
+          echo "Successfully authenticated to Vault"
+
+      # Step 3: Get AWS Credentials from Vault (15-minute TTL)
+      - name: Get AWS Credentials from Vault
+        id: aws-creds
+        run: |
+          # Request temporary AWS credentials from Vault's AWS secrets engine
+          AWS_CREDS=$(curl -s --header "X-Vault-Token: ${{ steps.vault-auth.outputs.token }}" \
+            "$VAULT_ADDR/v1/aws/creds/s3-creator")
+          
+          ACCESS_KEY=$(echo $AWS_CREDS | jq -r '.data.access_key')
+          SECRET_KEY=$(echo $AWS_CREDS | jq -r '.data.secret_key')
+          SECURITY_TOKEN=$(echo $AWS_CREDS | jq -r '.data.security_token // empty')
+          LEASE_DURATION=$(echo $AWS_CREDS | jq -r '.lease_duration')
+          
+          if [ "$ACCESS_KEY" == "null" ] || [ -z "$ACCESS_KEY" ]; then
+            echo "Failed to get AWS credentials from Vault"
+            echo $AWS_CREDS | jq .
+            exit 1
+          fi
+          
+          # Mask sensitive values
+          echo "::add-mask::$ACCESS_KEY"
+          echo "::add-mask::$SECRET_KEY"
+          echo "::add-mask::$SECURITY_TOKEN"
+          
+          # Set outputs
+          echo "access_key=$ACCESS_KEY" >> $GITHUB_OUTPUT
+          echo "secret_key=$SECRET_KEY" >> $GITHUB_OUTPUT
+          echo "security_token=$SECURITY_TOKEN" >> $GITHUB_OUTPUT
+          
+          echo "Retrieved AWS credentials (TTL: ${LEASE_DURATION}s)"
+
+      # Step 4: Configure AWS Credentials
+      - name: Configure AWS Credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << EOF
+          [default]
+          aws_access_key_id = ${{ steps.aws-creds.outputs.access_key }}
+          aws_secret_access_key = ${{ steps.aws-creds.outputs.secret_key }}
+          aws_session_token = ${{ steps.aws-creds.outputs.security_token }}
+          EOF
+          
+          cat > ~/.aws/config << EOF
+          [default]
+          region = ${{ env.AWS_REGION }}
+          output = json
+          EOF
+
+      # Step 5: Terraform Init
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      # Step 6: Terraform Plan
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: terraform plan -out=tfplan
+
+      # Step 7: Terraform Apply (only on main branch push)
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+
+      # Step 8: Show Outputs
+      - name: Show Terraform Outputs
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        working-directory: ./terraform
+        run: terraform output
+
+      # Cleanup: Revoke Vault token
+      - name: Cleanup - Revoke Vault Token
+        if: always()
+        run: |
+          if [ -n "${{ steps.vault-auth.outputs.token }}" ]; then
+            curl -s --header "X-Vault-Token: ${{ steps.vault-auth.outputs.token }}" \
+              --request POST \
+              "$VAULT_ADDR/v1/auth/token/revoke-self" || true
+            echo "Vault token revoked"
+          fi
