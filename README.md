@@ -1,5 +1,7 @@
 # DevSecOps: GitHub Actions + HashiCorp Vault OIDC + AWS Terraform
 
+![Flow Diagram](flow.png)
+
 A secure DevSecOps pipeline demonstrating zero-trust credential management using GitHub Actions, HashiCorp Vault OIDC integration, and Terraform for AWS S3 bucket creation.
 
 ## Security Features
